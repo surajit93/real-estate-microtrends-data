@@ -2,8 +2,11 @@ name: WOF Generate Folders
 
 on:
   schedule:
-    - cron: "0 2 * * *"   # daily 2am UTC
+    - cron: "0 2 * * *"   # daily
   workflow_dispatch:
+
+permissions:
+  contents: write   # IMPORTANT: allows pushing
 
 jobs:
   generate:
@@ -13,7 +16,7 @@ jobs:
       - name: Checkout repo
         uses: actions/checkout@v4
         with:
-          persist-credentials: true
+          persist-credentials: false   # IMPORTANT
           lfs: false
 
       - name: Setup Node.js
@@ -23,7 +26,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          npm install fast-glob unzipper
+          npm install fast-glob unzipper axios fs-extra
 
       - name: Run WOF folder generator
         env:
@@ -32,10 +35,15 @@ jobs:
         run: |
           node wof_create_folders.js
 
-      - name: Commit changes
+      - name: Commit & Push changes
+        env:
+          PAT_TOKEN: ${{ secrets.PAT_TOKEN }}
         run: |
-          git config --global user.name "GitHub Actions"
           git config --global user.email "actions@github.com"
+          git config --global user.name "GitHub Actions"
+
           git add .
           git diff --cached --quiet || git commit -m "WOF auto-update"
-          git push
+
+          git remote set-url origin https://${PAT_TOKEN}@github.com/${{ github.repository }}
+          git push origin HEAD:main
