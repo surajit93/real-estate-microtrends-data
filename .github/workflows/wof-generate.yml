@@ -1,54 +1,39 @@
 name: WOF Generate Folders
 
-permissions:
-  contents: write   # REQUIRED to push changes
-
 on:
   schedule:
-    - cron: '0 2 * * *'
+    - cron: "0 2 * * *"
   workflow_dispatch:
 
 jobs:
   generate:
     runs-on: ubuntu-latest
-    steps:
-      - name: Checkout repo (with LFS)
-        uses: actions/checkout@v4
-        with:
-          lfs: true
-          persist-credentials: false   # safe, we will configure PAT manually
-          fetch-depth: 0
 
-      - name: Setup git for PAT-based push
-        run: |
-          git config --global user.name "wof-bot"
-          git config --global user.email "actions@github.com"
-          git remote set-url origin https://x-access-token:${{ secrets.PAT_TOKEN }}@github.com/surajit93/real-estate-microtrends-data.git
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '20.x'
+          node-version: "20.x"
 
-      - name: Install deps
-        run: |
-          npm ci || npm install
-        env:
-          CI: true
+      - name: Install dependencies
+        run: npm install
 
-      - name: Run WOF folder generator
+      - name: Run generator script
         env:
           PAT_TOKEN: ${{ secrets.PAT_TOKEN }}
           GITHUB_OWNER: surajit93
           GITHUB_REPO: real-estate-microtrends-data
           BRANCH: main
-          WOF_DATA_DIR: 'data/wof'
-          WOF_CONCURRENCY: '4'
-        run: |
-          node wof_create_folders.js
+          WOF_DATA_DIR: "data/wof"
+        run: node wof_create_folders.js
 
-      - name: Commit & push changes
+      - name: Commit and Push
         run: |
-          git add .
-          git commit -m "Add/Update WOF folders" || echo "No changes"
-          git push origin HEAD:main
+          git config user.email "actions@github.com"
+          git config user.name "GitHub Actions"
+          git add -A
+          git commit -m "Update WOF folders" || echo "No changes"
+          git push https://x-access-token:${{ secrets.PAT_TOKEN }}@github.com/${{ github.repository }}.git HEAD:${{ github.ref }}
