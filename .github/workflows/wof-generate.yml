@@ -1,8 +1,10 @@
 name: WOF Generate Folders
 
+permissions:
+  contents: write   # REQUIRED to push changes
+
 on:
   schedule:
-    # run daily (adjust)
     - cron: '0 2 * * *'
   workflow_dispatch:
 
@@ -14,7 +16,14 @@ jobs:
         uses: actions/checkout@v4
         with:
           lfs: true
-          persist-credentials: false
+          persist-credentials: false   # safe, we will configure PAT manually
+          fetch-depth: 0
+
+      - name: Setup git for PAT-based push
+        run: |
+          git config --global user.name "wof-bot"
+          git config --global user.email "actions@github.com"
+          git remote set-url origin https://x-access-token:${{ secrets.PAT_TOKEN }}@github.com/surajit93/real-estate-microtrends-data.git
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -37,3 +46,9 @@ jobs:
           WOF_CONCURRENCY: '4'
         run: |
           node wof_create_folders.js
+
+      - name: Commit & push changes
+        run: |
+          git add .
+          git commit -m "Add/Update WOF folders" || echo "No changes"
+          git push origin HEAD:main
