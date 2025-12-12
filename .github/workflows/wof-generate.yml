@@ -12,6 +12,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          path: "./repo"
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -19,7 +21,9 @@ jobs:
           node-version: "20.x"
 
       - name: Install dependencies
-        run: npm install
+        run: |
+          cd repo
+          npm install
 
       - name: Run WOF folder generator
         env:
@@ -28,12 +32,14 @@ jobs:
           GITHUB_REPO: real-estate-microtrends-data
           BRANCH: main
           WOF_DATA_DIR: "data/wof"
-        run: node wof_create_folders.js
+        run: |
+          node repo/wof_create_folders.js
 
       - name: Commit and push changes
         run: |
+          cd repo
           git config user.email "actions@github.com"
           git config user.name "GitHub Actions"
           git add -A
-          git commit -m "WOF data update" || echo "No changes to commit"
+          git commit -m "WOF data update" || echo "No changes"
           git push https://x-access-token:${{ secrets.PAT_TOKEN }}@github.com/${{ github.repository }} HEAD:${{ github.ref }}
