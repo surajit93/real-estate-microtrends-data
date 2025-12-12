@@ -29,10 +29,10 @@ jobs:
 
       - name: Run WOF folder generator
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GITHUB_OWNER: ${{ github.repository_owner }}
-          GITHUB_REPO: ${{ github.event.repository.name }}
-          BRANCH: 'main'
+          PAT_TOKEN: ${{ secrets.PAT_TOKEN }}
+          GITHUB_OWNER: surajit93
+          GITHUB_REPO: real-estate-microtrends-data
+          BRANCH: main
           WOF_DATA_DIR: 'data/wof'
           WOF_CONCURRENCY: '4'
         run: |
