@@ -2,48 +2,102 @@ name: WOF Generate Folders
 
 on:
   schedule:
-    - cron: "0 2 * * *"   # daily
+    - cron: '0 2 * * *'   # daily at 2 AM
   workflow_dispatch:
-
-permissions:
-  contents: write   # IMPORTANT: allows pushing
 
 jobs:
   generate:
     runs-on: ubuntu-latest
 
+    permissions:
+      contents: write       # REQUIRED so github-actions can push
+      actions: read
+      checks: read
+
     steps:
+      # -------------------------------------------------------
+      # 1. CHECKOUT REPO (NO CREDENTIALS, CLEAN)
+      # -------------------------------------------------------
       - name: Checkout repo
         uses: actions/checkout@v4
         with:
-          persist-credentials: false   # IMPORTANT
           lfs: false
+          persist-credentials: false
 
+      # -------------------------------------------------------
+      # 2. Ensure .gitignore has node_modules ignored
+      # -------------------------------------------------------
+      - name: Add node_modules to .gitignore (safety)
+        run: |
+          echo "node_modules/" >> .gitignore
+
+      # -------------------------------------------------------
+      # 3. Setup Node.js
+      # -------------------------------------------------------
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: '20.x'
 
+      # -------------------------------------------------------
+      # 4. Install required dependencies manually
+      # -------------------------------------------------------
       - name: Install dependencies
         run: |
-          npm install fast-glob unzipper axios fs-extra
+          npm init -y
+          npm install axios fast-glob fs-extra dotenv p-limit
 
+      # -------------------------------------------------------
+      # 5. Download latest WOF COUNTRY bundle (correct S3 link)
+      # -------------------------------------------------------
+      - name: Download WOF bundle
+        run: |
+          mkdir -p data/wof
+          cd data/wof
+          echo "Downloading WOF country bundle..."
+          wget https://whosonfirst-data.s3.amazonaws.com/bundles/wof-country-latest-bundle.zip -O wof.zip
+          echo "Unzipping..."
+          unzip -q wof.zip
+          rm wof.zip
+          echo "WOF data ready."
+
+      # -------------------------------------------------------
+      # 6. Run your script with progress %, skip-existing, parallel
+      # -------------------------------------------------------
       - name: Run WOF folder generator
         env:
-          WOF_DATA_DIR: "data/wof"
-          WOF_CONCURRENCY: "6"
+          PAT_TOKEN: ${{ secrets.PAT_TOKEN }}
+          GITHUB_OWNER: surajit93
+          GITHUB_REPO: real-estate-microtrends-data
+          BRANCH: main
+          WOF_DATA_DIR: 'data/wof'
+          WOF_CONCURRENCY: '8'
         run: |
+          echo "Starting generation..."
           node wof_create_folders.js
 
-      - name: Commit & Push changes
+      # -------------------------------------------------------
+      # 7. Commit ONLY changes to your repository structure
+      # -------------------------------------------------------
+      - name: Commit results
+        run: |
+          git config --global user.name "GitHub Actions"
+          git config --global user.email "actions@github.com"
+
+          git add -A
+
+          if git diff --cached --quiet; then
+            echo "No changes – nothing to commit."
+            exit 0
+          fi
+
+          git commit -m "WOF auto-update"
+          
+      # -------------------------------------------------------
+      # 8. Push back to repo using PAT (NOT github-actions bot)
+      # -------------------------------------------------------
+      - name: Push changes
         env:
           PAT_TOKEN: ${{ secrets.PAT_TOKEN }}
         run: |
-          git config --global user.email "actions@github.com"
-          git config --global user.name "GitHub Actions"
-
-          git add .
-          git diff --cached --quiet || git commit -m "WOF auto-update"
-
-          git remote set-url origin https://${PAT_TOKEN}@github.com/${{ github.repository }}
-          git push origin HEAD:main
+          git push https://$PAT_TOKEN@github.com/${{ env.GITHUB_OWNER }}/${{ env.GITHUB_REPO }}.git HEAD:main
