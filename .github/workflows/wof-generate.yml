@@ -1,0 +1,39 @@
+name: WOF Generate Folders
+
+on:
+  schedule:
+    # run daily (adjust)
+    - cron: '0 2 * * *'
+  workflow_dispatch:
+
+jobs:
+  generate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo (with LFS)
+        uses: actions/checkout@v4
+        with:
+          lfs: true
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20.x'
+
+      - name: Install deps
+        run: |
+          npm ci || npm install
+        env:
+          CI: true
+
+      - name: Run WOF folder generator
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_OWNER: ${{ github.repository_owner }}
+          GITHUB_REPO: ${{ github.event.repository.name }}
+          BRANCH: 'main'
+          WOF_DATA_DIR: 'data/wof'
+          WOF_CONCURRENCY: '4'
+        run: |
+          node wof_create_folders.js
