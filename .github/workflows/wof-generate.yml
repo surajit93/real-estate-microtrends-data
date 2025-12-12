@@ -2,85 +2,45 @@ name: WOF Generate Folders
 
 on:
   schedule:
-    - cron: "0 2 * * *"   # runs daily at 02:00 UTC
-  workflow_dispatch:       # manual trigger
+    - cron: '0 2 * * *'   # daily at 02:00 UTC — adjust if needed
+  workflow_dispatch:
+
+permissions:
+  contents: write   # allow action to create/update files in repo
 
 jobs:
   generate:
     runs-on: ubuntu-latest
-
     steps:
-      # ------------------------------------------------------
-      # STEP 1: Checkout repository + LFS
-      # ------------------------------------------------------
-      - name: Checkout repo
+      - name: Checkout repo (no LFS required)
         uses: actions/checkout@v4
         with:
-          lfs: true
+          fetch-depth: 0
           persist-credentials: false
 
-      # ------------------------------------------------------
-      # STEP 2: Debug listing to verify correct files
-      # ------------------------------------------------------
-      - name: DEBUG — list repo files
-        run: |
-          echo "=== ROOT ==="
-          ls -R .
-
-      # ------------------------------------------------------
-      # STEP 3: Setup Node.js
-      # ------------------------------------------------------
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: "20.x"
+          node-version: '20.x'
 
-      # ------------------------------------------------------
-      # STEP 4: Install required packages manually
-      # (no package.json needed)
-      # ------------------------------------------------------
-      - name: Install required node modules
+      - name: Install npm deps
         run: |
-          npm install axios adm-zip @octokit/rest dotenv
+          # package.json isn't required — script uses only axios and @octokit/rest
+          npm init -y
+          npm i axios @octokit/rest p-queue
+        env:
+          CI: true
 
-      # ------------------------------------------------------
-      # STEP 5: Create directory for Who’s On First data
-      # ------------------------------------------------------
-      - name: Create WOF data directory
-        run: mkdir -p data/wof
-
-      # ------------------------------------------------------
-      # STEP 6: Download WOF hierarchical admin bundles
-      # (countries, regions, localities)
-      # ------------------------------------------------------
-      - name: Download WOF Admin Bundles
-        run: |
-          cd data/wof
-          wget https://data.whosonfirst.org/bundles/wof-country-latest-bundle.zip
-          wget https://data.whosonfirst.org/bundles/wof-region-latest-bundle.zip
-          wget https://data.whosonfirst.org/bundles/wof-locality-latest-bundle.zip
-
-      # ------------------------------------------------------
-      # STEP 7: Extract archive files
-      # ------------------------------------------------------
-      - name: Extract bundles
-        run: |
-          cd data/wof
-          unzip -o wof-country-latest-bundle.zip
-          unzip -o wof-region-latest-bundle.zip
-          unzip -o wof-locality-latest-bundle.zip
-
-      # ------------------------------------------------------
-      # STEP 8: RUN THE GENERATOR SCRIPT
-      # IMPORTANT: Must be at repo root → /wof_create_folders.js
-      # ------------------------------------------------------
-      - name: Run WOF Folder Generator
+      - name: Run WOF folder generator
         env:
           PAT_TOKEN: ${{ secrets.PAT_TOKEN }}
-          GITHUB_OWNER: surajit93
-          GITHUB_REPO: real-estate-microtrends-data
+          GITHUB_OWNER: ${{ github.repository_owner }}
+          GITHUB_REPO: ${{ github.event.repository.name }}
           BRANCH: main
-          WOF_DATA_DIR: "data/wof"
-          WOF_CONCURRENCY: "4"
+          TARGET_DIR: data/wof
+          WOF_ORG: whosonfirst-data
+          COUNTRY_CONCURRENCY: '1'
+          CITY_CONCURRENCY: '4'
+          LOCALITY_CONCURRENCY: '4'
         run: |
-          node wof_create_folders.js
+          node repo/wof_create_folders.js
