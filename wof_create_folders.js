@@ -1,242 +1,322 @@
-// wof_create_folders.js
-// Usage: NODE_ENV=production node wof_create_folders.js
-// Requires: npm i dotenv @octokit/rest p-queue fast-glob
-// Expects local WOF GeoJSON/JSON files under ./data/wof/** (recursive)
-//
-// Behavior:
-//  - Scans data/wof for .geojson/.json files, extracts properties:
-//      id (wof:id | properties['wof:id'] | properties.wof_id ...)
-//      parent_id (wof:parent_id | properties['wof:parent_id'] | parent_id ...)
-//      placetype
-//      name (properties.name || properties['name:en'] fallback)
-//  - Builds id->node map and children relations
-//  - Finds roots where placetype === 'country' (if none, tries top-level with no parent)
-//  - For each country, creates folders in GitHub: country/.keep then recurses states->cities->localities->sublocalities
-//  - Creates buyers.json, properties.json, metadata.json at leaves
-//  - Uses Octokit (GITHUB_TOKEN) to create/update files (branch from .env BRANCH or main)
-//
-// NOTE: large datasets should be added to the repo via Git LFS (see instructions below)
+// repo/wof_create_folders.js
+// Node 18+
+// Installs: axios @octokit/rest p-queue (workflow installs them on the runner)
 
-import dotenv from "dotenv";
-dotenv.config();
-
+import { Octokit } from "@octokit/rest";
+import axios from "axios";
+import PQueue from "p-queue";
 import fs from "fs/promises";
 import path from "path";
-import fg from "fast-glob";
-import PQueue from "p-queue";
-import { Octokit } from "@octokit/rest";
 
-const DATA_DIR = process.env.WOF_DATA_DIR || "data/wof";
-const OWNER = process.env.GITHUB_OWNER;
-const REPO = process.env.GITHUB_REPO;
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+const PAT_TOKEN = process.env.PAT_TOKEN;
+const OWNER = process.env.GITHUB_OWNER || process.env.GITHUB_REPOSITORY?.split("/")[0];
+const REPO = process.env.GITHUB_REPO || process.env.GITHUB_REPOSITORY?.split("/")[1];
 const BRANCH = process.env.BRANCH || "main";
-const TOKEN = process.env.GITHUB_TOKEN;
-const CONCURRENCY = parseInt(process.env.WOF_CONCURRENCY || "4", 10);
+const TARGET_DIR = process.env.TARGET_DIR || "data/wof";
+const WOF_ORG = process.env.WOF_ORG || "whosonfirst-data";
 
-if (!OWNER || !REPO || !TOKEN) {
-  console.error("Missing GITHUB_OWNER / GITHUB_REPO / GITHUB_TOKEN in env");
+const COUNTRY_CONCURRENCY = parseInt(process.env.COUNTRY_CONCURRENCY || "1", 10);
+const CITY_CONCURRENCY = parseInt(process.env.CITY_CONCURRENCY || "4", 10);
+const LOCALITY_CONCURRENCY = parseInt(process.env.LOCALITY_CONCURRENCY || "4", 10);
+
+if (!PAT_TOKEN) {
+  console.error("PAT_TOKEN required (store as repo secret).");
+  process.exit(1);
+}
+if (!OWNER || !REPO) {
+  console.error("GITHUB_OWNER and GITHUB_REPO required.");
   process.exit(1);
 }
 
-const octokit = new Octokit({ auth: TOKEN });
-const ghQueue = new PQueue({ concurrency: 1, intervalCap: 1 }); // keep GitHub serial to avoid conflicts
+const octokit = new Octokit({ auth: PAT_TOKEN });
 
-function sanitizeSegment(name) {
-  if (!name) return "unnamed";
-  return name.toString().normalize("NFKD")
+// helper sanitize
+function sanitize(s) {
+  if (!s) return "unnamed";
+  return s.toString()
+    .normalize("NFKD")
     .replace(/[\/:*?"<>|\\'#%]/g, "_")
     .replace(/\s+/g, "_")
     .replace(/_+/g, "_")
     .trim();
 }
 
-function pickBestName(props) {
-  if (!props) return null;
-  return props.name || props["name:en"] || props["wof:name"] || props["geom_name"] || props["label"] || null;
-}
-
-function getPropVariants(props, ...keys) {
-  for (const k of keys) {
-    if (props?.[k] !== undefined) return props[k];
-  }
-  return undefined;
-}
-
-async function readAllWofFiles() {
-  const patterns = [
-    `${DATA_DIR}/**/*.geojson`,
-    `${DATA_DIR}/**/*.json`
-  ];
-  const files = await fg(patterns, { dot: false, onlyFiles: true });
-  const nodes = [];
-  for (const f of files) {
+// create or update file (base64 content) using REST API
+async function githubPutFile(pathInRepo, contentStr, msg) {
+  try {
+    // get current sha if exists
+    let sha = null;
     try {
-      const txt = await fs.readFile(f, "utf8");
-      const js = JSON.parse(txt);
-      // WOF files may be Feature or FeatureCollection; handle both
-      if (js.type === "FeatureCollection" && Array.isArray(js.features)) {
-        for (const feat of js.features) {
-          const props = feat.properties || {};
-          const id = getPropVariants(props, "wof:id", "wof_id", "id", "id:wof");
-          const parent = getPropVariants(props, "wof:parent_id", "wof_parent", "parent_id", "parent");
-          const placetype = getPropVariants(props, "placetype", "wof:placetype");
-          const name = pickBestName(props);
-          if (id && name) nodes.push({ id: Number(id), parent: parent ? Number(parent) : null, placetype, name, rawProps: props });
-        }
-      } else if (js.type === "Feature") {
-        const props = js.properties || {};
-        const id = getPropVariants(props, "wof:id", "wof_id", "id");
-        const parent = getPropVariants(props, "wof:parent_id", "parent_id", "parent");
-        const placetype = getPropVariants(props, "placetype", "wof:placetype");
-        const name = pickBestName(props);
-        if (id && name) nodes.push({ id: Number(id), parent: parent ? Number(parent) : null, placetype, name, rawProps: props });
-      } else if (js.properties) {
-        const props = js.properties || {};
-        const id = getPropVariants(props, "wof:id", "wof_id", "id");
-        const parent = getPropVariants(props, "wof:parent_id", "parent_id", "parent");
-        const placetype = getPropVariants(props, "placetype", "wof:placetype");
-        const name = pickBestName(props);
-        if (id && name) nodes.push({ id: Number(id), parent: parent ? Number(parent) : null, placetype, name, rawProps: props });
-      } else {
-        // try top-level fields
-        const props = js;
-        const id = getPropVariants(props, "wof:id", "wof_id", "id");
-        const parent = getPropVariants(props, "wof:parent_id", "parent_id", "parent");
-        const placetype = getPropVariants(props, "placetype", "wof:placetype");
-        const name = pickBestName(props);
-        if (id && name) nodes.push({ id: Number(id), parent: parent ? Number(parent) : null, placetype, name, rawProps: props });
-      }
+      const res = await octokit.repos.getContent({
+        owner: OWNER, repo: REPO, path: pathInRepo, ref: BRANCH
+      });
+      if (res && res.data && res.data.sha) sha = res.data.sha;
+    } catch (err) {
+      if (err.status !== 404) console.warn("getContent error", err.status);
+    }
+
+    await octokit.repos.createOrUpdateFileContents({
+      owner: OWNER,
+      repo: REPO,
+      path: pathInRepo,
+      message: msg,
+      content: Buffer.from(contentStr, "utf8").toString("base64"),
+      branch: BRANCH,
+      sha: sha || undefined
+    });
+    return true;
+  } catch (err) {
+    console.error("githubPutFile failed", pathInRepo, err.status || err.message || err);
+    return false;
+  }
+}
+
+async function createFolderPlaceholder(folderPath) {
+  const clean = folderPath.replace(/^\/+|\/+$/g, "");
+  const keepPath = `${clean}/.keep`;
+  const content = JSON.stringify({ created: new Date().toISOString(), note: "placeholder" }, null, 2);
+  return githubPutFile(keepPath, content, `Init folder ${clean}`);
+}
+
+async function createLeafFiles(folderPath) {
+  const base = folderPath.replace(/^\/+|\/+$/g, "");
+  await githubPutFile(`${base}/buyers.json`, JSON.stringify({ buyers: [] }, null, 2), `init buyers for ${base}`);
+  await githubPutFile(`${base}/properties.json`, JSON.stringify({ properties: [] }, null, 2), `init properties for ${base}`);
+  await githubPutFile(`${base}/metadata.json`, JSON.stringify({ created: new Date().toISOString() }, null, 2), `init metadata for ${base}`);
+}
+
+// list repos for WOF org and filter admin repos (country/state-level repos)
+async function listWofAdminRepos() {
+  const res = await octokit.paginate(octokit.repos.listForOrg, {
+    org: WOF_ORG,
+    type: "public",
+    per_page: 100
+  });
+  // filter repos with pattern whosonfirst-data-admin-*
+  return res.filter(r => r.name && r.name.startsWith("whosonfirst-data-admin-"));
+}
+
+// fetch raw file from a repo (raw github URL)
+async function fetchRawFromRepo(owner, repo, filePath) {
+  const url = `https://raw.githubusercontent.com/${owner}/${repo}/main/${filePath}`;
+  try {
+    const r = await axios.get(url, { timeout: 120000 });
+    return r.data;
+  } catch (err) {
+    // file maybe in 'master' branch or path different; fallback: try HEAD branch
+    try {
+      const repoMeta = await octokit.repos.get({ owner, repo });
+      const defaultBranch = repoMeta.data.default_branch || "main";
+      const url2 = `https://raw.githubusercontent.com/${owner}/${repo}/${defaultBranch}/${filePath}`;
+      const r2 = await axios.get(url2, { timeout: 120000 });
+      return r2.data;
     } catch (e) {
-      // ignore parse errors — files may be non-WOF
+      return null;
     }
   }
-  return nodes;
 }
 
-function buildTree(nodes) {
-  const map = new Map();
-  for (const n of nodes) map.set(n.id, { ...n, children: [] });
-  for (const [id, n] of map.entries()) {
-    if (n.parent && map.has(n.parent)) {
-      map.get(n.parent).children.push(n);
+// Find the "canonical" place record files in a repo: we look under ./data/
+async function findPlaceFilesForRepo(owner, repo) {
+  // try to get a listing under data/ or data/places/... search common paths
+  const candidates = [
+    "data/places/wof",            // sometimes
+    "data/places",                // sometimes
+    "data",                       // some repos store top-level
+    ""                            // fallback
+  ];
+  const placeFiles = [];
+
+  // we'll attempt to fetch list of keys under 'data/' using the GitHub tree API
+  try {
+    // get repo tree for default branch
+    const { data: repoMeta } = await octokit.repos.get({ owner, repo });
+    const defaultBranch = repoMeta.default_branch || "main";
+
+    const treeRes = await octokit.git.getTree({
+      owner, repo, tree_sha: defaultBranch, recursive: "1"
+    });
+    const allPaths = (treeRes.data.tree || []).map(t => t.path);
+
+    // heuristic: collect .geojson files and .json that look like wof records
+    for (const p of allPaths) {
+      if (p.endsWith(".geojson") || p.endsWith(".json")) {
+        // only include files under a 'data' folder or 'places' folder to avoid large unrelated files
+        if (p.includes("/data/") || p.startsWith("data/") || p.includes("/places/") || p.includes("place")) {
+          placeFiles.push(p);
+        }
+      }
+    }
+  } catch (err) {
+    // tree API can fail on some repos or size restrictions; fallback to try a known file
+  }
+
+  return placeFiles;
+}
+
+// parse a WOF record (geojson) and extract useful bits
+function parseWofRecord(obj) {
+  if (!obj) return null;
+  // WOF records usually have properties: 'properties' contains 'wof:id', 'name', 'wof:parent_id', 'wof:admin_level'
+  const props = obj.properties || obj;
+  const id = props["wof:id"] || props["id"] || props["wof:placetype"] ? null : null;
+  const name = props["wof:name"] || props["properties:fullname"] || props["name"] || (props.names && Object.values(props.names)[0]);
+  const parent = props["wof:parent_id"] || props["wof:belongsto"] || props["parent_id"] || null;
+  const admin_level = props["wof:admin_level"] || props["admin_level"] || null;
+  return {
+    id: props["wof:id"] || props["id"] || null,
+    wof_id: props["wof:id"] || props["id"] || null,
+    name: name || null,
+    parent_id: props["wof:parent_id"] || null,
+    admin_level
+  };
+}
+
+// Build hierarchy map in memory from list of records
+function buildHierarchy(records) {
+  const map = new Map(); // wof_id -> node
+  for (const r of records) {
+    if (!r || !r.wof_id || !r.name) continue;
+    map.set(String(r.wof_id), { ...r, children: [] });
+  }
+  // attach children
+  for (const [k, v] of map) {
+    const p = String(v.parent_id || "");
+    if (p && map.has(p)) {
+      map.get(p).children.push(v);
     }
   }
   return map;
 }
 
-async function githubGetSha(path) {
-  try {
-    const res = await octokit.repos.getContent({ owner: OWNER, repo: REPO, path, ref: BRANCH });
-    if (res && res.data && res.data.sha) return res.data.sha;
-  } catch (e) {
-    if (e.status !== 404) {
-      console.warn("GitHub getContent error", e.status || e.message);
-    }
-  }
-  return null;
-}
-
-async function githubPut(path, content, message) {
-  return ghQueue.add(async () => {
-    const encoded = Buffer.from(content, "utf8").toString("base64");
-    const sha = await githubGetSha(path);
-    try {
-      await octokit.repos.createOrUpdateFileContents({
-        owner: OWNER, repo: REPO, path, message,
-        content: encoded, branch: BRANCH, sha: sha || undefined
-      });
-      return true;
-    } catch (e) {
-      console.warn("GitHub put failed", path, e.status || e.message);
-      return false;
-    }
-  });
-}
-
-async function createFolderPlaceholder(folderPath) {
-  const clean = folderPath.replace(/^\/+|\/+$/g, "");
-  const p = `${clean}/.keep`;
-  const body = JSON.stringify({ created: new Date().toISOString(), source: "wof-create" }, null, 2);
-  return githubPut(p, body, `Create placeholder ${clean}`);
-}
-
-async function createLeafFiles(folderPath) {
-  const clean = folderPath.replace(/^\/+|\/+$/g, "");
-  await githubPut(`${clean}/buyers.json`, JSON.stringify({ buyers: [] }, null, 2), `Init buyers for ${clean}`);
-  await githubPut(`${clean}/properties.json`, JSON.stringify({ properties: [] }, null, 2), `Init properties for ${clean}`);
-  await githubPut(`${clean}/metadata.json`, JSON.stringify({ created: new Date().toISOString() }, null, 2), `Init metadata for ${clean}`);
-}
-
-function nodeToSegment(node) {
-  const seg = sanitizeSegment(node.name);
-  // add wof id to avoid collisions (optional)
-  return `${seg}`;
-}
-
-async function recurseCreate(node, parentPath, map) {
-  // node: contains id,name,placetype,children[]
-  const seg = nodeToSegment(node);
-  const myPath = parentPath ? `${parentPath}/${seg}` : seg;
-
-  // create placeholder for this node
-  await createFolderPlaceholder(myPath);
-
+// create path segments and push folders/files
+async function ensureGitFoldersForNode(node, basePath) {
+  const seg = sanitize(node.name);
+  const fullPath = `${basePath}/${seg}`;
+  await createFolderPlaceholder(fullPath);
+  // if leaf (no children) create leaf files
   if (!node.children || node.children.length === 0) {
-    // leaf
-    await createLeafFiles(myPath);
+    await createLeafFiles(fullPath);
+  }
+  return fullPath;
+}
+
+async function processCountryRepo(repoObj) {
+  const repoName = repoObj.name;
+  console.log("Processing repo:", repoName);
+
+  // find place files
+  const placeFiles = await findPlaceFilesForRepo(repoObj.owner.login, repoName);
+  if (!placeFiles || placeFiles.length === 0) {
+    console.log("No place files detected in repo:", repoName);
     return;
   }
 
-  // create children concurrently but rate-limited via queue when calling GitHub
-  const q = new PQueue({ concurrency: CONCURRENCY });
-  for (const ch of node.children) {
-    q.add(async () => {
-      // upsert DB is optional; skip DB operations unless you want them
-      await recurseCreate(ch, myPath, map);
-    });
+  // fetch the candidate place files, parse JSON, filter only records with admin-level (country/state/city/locality)
+  const parsed = [];
+  for (const p of placeFiles) {
+    try {
+      const raw = await fetchRawFromRepo(repoObj.owner.login, repoName, p);
+      if (!raw) continue;
+      // raw could be JSON string or object already
+      const obj = typeof raw === "string" ? JSON.parse(raw) : raw;
+      // if this is a FeatureCollection, iterate features
+      if (obj.type === "FeatureCollection" && Array.isArray(obj.features)) {
+        for (const f of obj.features) {
+          const pr = parseWofRecord(f);
+          if (pr && pr.wof_id && pr.name) parsed.push(pr);
+        }
+      } else {
+        const pr = parseWofRecord(obj);
+        if (pr && pr.wof_id && pr.name) parsed.push(pr);
+      }
+    } catch (err) {
+      // ignore broken files
+    }
   }
-  await q.onIdle();
+
+  if (!parsed.length) {
+    console.log("No parseable WOF records in", repoName);
+    return;
+  }
+
+  // build a hierarchy map for this repo's records
+  const map = buildHierarchy(parsed);
+
+  // find top-level nodes (those without a parent in this map)
+  const roots = [];
+  for (const [k, node] of map) {
+    const parent = String(node.parent_id || "");
+    if (!parent || !map.has(parent)) roots.push(node);
+  }
+
+  // For each root, create folder under TARGET_DIR/<repo-repr> and then recursively create children
+  for (const root of roots) {
+    const repoBase = `${TARGET_DIR}/${sanitize(repoName)}`;
+    await createFolderPlaceholder(repoBase);
+
+    // create root folder
+    const rootPath = `${repoBase}/${sanitize(root.name)}`;
+    await createFolderPlaceholder(rootPath);
+
+    // BFS/DFS traversal to create folders
+    const stack = [{ node: root, path: rootPath }];
+    while (stack.length) {
+      const { node, path: nodePath } = stack.pop();
+      // create placeholder at nodePath (done for root earlier)
+      await createFolderPlaceholder(nodePath);
+
+      if (!node.children || node.children.length === 0) {
+        await createLeafFiles(nodePath);
+      } else {
+        // push children
+        for (const ch of node.children) {
+          const childPath = `${nodePath}/${sanitize(ch.name)}`;
+          await createFolderPlaceholder(childPath);
+          stack.push({ node: ch, path: childPath });
+        }
+      }
+    }
+  }
+
+  console.log("Done repo:", repoName);
 }
 
-(async function main() {
-  console.log("WOF folder builder starting — scanning local WOF files...");
-  const nodesArr = await readAllWofFiles();
-  if (!nodesArr || nodesArr.length === 0) {
-    console.error("No WOF nodes found under", DATA_DIR);
-    process.exit(1);
+async function main() {
+  console.log("Starting WOF folder generator");
+  // list admin repos
+  const adminRepos = await listWofAdminRepos();
+  if (!adminRepos || adminRepos.length === 0) {
+    console.error("No admin repos found under", WOF_ORG);
+    return;
   }
 
-  const map = buildTree(nodesArr);
-  // find country roots
-  const countries = [];
-  for (const node of map.values()) {
-    if (node.placetype === "country") countries.push(node);
-  }
-  // fallback: nodes without parent
-  if (countries.length === 0) {
-    for (const node of map.values()) {
-      if (!node.parent) countries.push(node);
+  // optionally filter only country-level repos: names like whosonfirst-data-admin-us, -in, etc.
+  const countryRepos = adminRepos.filter(r => {
+    // many admin repos exist; treat country repos as those ending with two-letter codes
+    const m = r.name.match(/^whosonfirst-data-admin-([a-z0-9-]+)$/);
+    return !!m;
+  });
+
+  console.log("Found admin repos:", countryRepos.length);
+
+  // process sequentially to avoid PUT conflicts
+  for (const repoObj of countryRepos) {
+    try {
+      await processCountryRepo(repoObj);
+      // small pause between repos to reduce rate pressure
+      await sleep(800);
+    } catch (err) {
+      console.warn("Repo processing failed for", repoObj.name, (err && err.message) || err);
     }
   }
 
-  console.log("Found countries:", countries.length);
-  for (const c of countries) {
-    // create root placeholder
-    const rootSeg = nodeToSegment(c);
-    const rootPath = `${rootSeg}`;
-    console.log("Processing country:", c.name, "->", rootPath);
-    await createFolderPlaceholder(rootPath);
-    if (!c.children || c.children.length === 0) {
-      await createLeafFiles(rootPath);
-      continue;
-    }
-    // sequentially recurse for each child to avoid concurrent writes that create conflicts
-    for (const st of c.children) {
-      await recurseCreate(st, rootPath, map);
-    }
-    // after finishing children, mark root leaf metadata
-    await githubPut(`${rootPath}/metadata.json`, JSON.stringify({ created: new Date().toISOString() }, null, 2), `country metadata ${rootPath}`);
-  }
+  console.log("All done");
+}
 
-  console.log("Done. All country folders attempted.");
-})();
+main().catch(err => {
+  console.error("Fatal:", err && err.stack ? err.stack : err);
+  process.exit(1);
+});
