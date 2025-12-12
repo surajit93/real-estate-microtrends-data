@@ -10,7 +10,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout repo
+      - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Setup Node.js
@@ -21,7 +21,7 @@ jobs:
       - name: Install dependencies
         run: npm install
 
-      - name: Run generator script
+      - name: Run WOF folder generator
         env:
           PAT_TOKEN: ${{ secrets.PAT_TOKEN }}
           GITHUB_OWNER: surajit93
@@ -30,10 +30,10 @@ jobs:
           WOF_DATA_DIR: "data/wof"
         run: node wof_create_folders.js
 
-      - name: Commit and Push
+      - name: Commit and push changes
         run: |
           git config user.email "actions@github.com"
           git config user.name "GitHub Actions"
           git add -A
-          git commit -m "Update WOF folders" || echo "No changes"
-          git push https://x-access-token:${{ secrets.PAT_TOKEN }}@github.com/${{ github.repository }}.git HEAD:${{ github.ref }}
+          git commit -m "WOF data update" || echo "No changes to commit"
+          git push https://x-access-token:${{ secrets.PAT_TOKEN }}@github.com/${{ github.repository }} HEAD:${{ github.ref }}
