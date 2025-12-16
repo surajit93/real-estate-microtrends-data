@@ -1,41 +1,41 @@
 name: WOF Build Tree
 
 on:
+  workflow_dispatch:
   schedule:
     - cron: "0 2 * * *"
-  workflow_dispatch:
-
-permissions:
-  contents: write
 
 jobs:
   build:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
 
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          persist-credentials: false
 
-      - uses: actions/setup-node@v4
+      - name: Setup Node 20
+        uses: actions/setup-node@v4
         with:
           node-version: 20
 
-      - name: Install deps
+      - name: Install dependencies
         run: |
           npm init -y
-          npm i axios @octokit/rest
+          npm install
 
       - name: Run builder
         env:
           PAT_TOKEN: ${{ secrets.PAT_TOKEN }}
-        run: node repo/wof_create_folders.js
+        run: |
+          node repo/wof_create_folders.js
 
-      - name: Commit & push
+      - name: Commit & Push
         run: |
           git config user.name "GitHub Actions"
           git config user.email "actions@github.com"
           git add -A
-          git commit -m "Update geolocations tree $(date)" || echo "No changes"
+          git commit -m "Update geolocations tree ($(date))" || echo "No changes"
           git push
