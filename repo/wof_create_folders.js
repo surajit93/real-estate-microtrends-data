@@ -1,77 +1,56 @@
-// =======================================================
-// wof_create_folders.v2.js  — HYBRID V2 (PRODUCTION SAFE)
-// =======================================================
-// Node 18+ | GitHub Actions
-// No Overpass | Pure WOF | Cycle-proof
-// =======================================================
+// ===========================================================
+// HYBRID V3 — LOCAL FILESYSTEM VERSION (NO API RATE LIMIT)
+// ===========================================================
+// Creates full WOF hierarchy on runner filesystem,
+// then commits all changes in one push.
+// ===========================================================
 
-import { Octokit } from "@octokit/rest";
+import fs from "fs";
+import fsp from "fs/promises";
+import path from "path";
 import axios from "axios";
+import { Octokit } from "@octokit/rest";
 
 // ---------------- ENV ----------------
 const TOKEN  = process.env.PAT_TOKEN;
-const OWNER  = process.env.GITHUB_OWNER || process.env.GITHUB_REPOSITORY.split("/")[0];
-const REPO   = process.env.GITHUB_REPO  || process.env.GITHUB_REPOSITORY.split("/")[1];
-const BRANCH = process.env.BRANCH || "main";
-const ROOT   = "real-estate";
-const WOF_ORG = "whosonfirst-data";
+const GITHUB_REPOSITORY = process.env.GITHUB_REPOSITORY;
+const OWNER  = GITHUB_REPOSITORY.split("/")[0];
+const REPO   = GITHUB_REPOSITORY.split("/")[1];
 
-if (!TOKEN) throw new Error("PAT_TOKEN missing");
+const ROOT_DIR = "real-estate";
+const WOF_ORG  = "whosonfirst-data";
 
-// ---------------- GITHUB ----------------
+// ---------------- GitHub ----------------
 const octokit = new Octokit({ auth: TOKEN });
 
-// ---------------- RULES ----------------
-const PLACETYPE_CHAIN = {
-  country: ["region"],
-  region: ["locality"],
-  locality: ["neighbourhood"],
-  neighbourhood: ["microhood"]
-};
-
-const ALLOWED = new Set(Object.keys(PLACETYPE_CHAIN));
-
-// ---------------- HELPERS ----------------
+// ---------------- Helpers ----------------
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 function sanitize(name) {
-  return name.normalize("NFKD")
+  return name
+    .normalize("NFKD")
     .replace(/[^\w\s-]/g, "")
     .replace(/\s+/g, "_")
     .trim();
 }
 
-async function putFile(path, content) {
-  let sha;
-  try {
-    const r = await octokit.repos.getContent({ owner: OWNER, repo: REPO, path, ref: BRANCH });
-    sha = r.data.sha;
-  } catch {}
-
-  await octokit.repos.createOrUpdateFileContents({
-    owner: OWNER,
-    repo: REPO,
-    branch: BRANCH,
-    path,
-    message: `init ${path}`,
-    content: Buffer.from(content).toString("base64"),
-    sha
-  });
+async function ensureDir(dir) {
+  await fsp.mkdir(dir, { recursive: true });
 }
 
-async function ensureFolder(path) {
-  await putFile(`${path}/.keep`, JSON.stringify({ created: new Date().toISOString() }, null, 2));
+async function writeJSON(filePath, obj) {
+  await fsp.writeFile(filePath, JSON.stringify(obj, null, 2));
 }
 
-async function ensureLeaf(path) {
-  await putFile(`${path}/buyers.json`, JSON.stringify({ buyers: [] }, null, 2));
-  await putFile(`${path}/properties.json`, JSON.stringify({ properties: [] }, null, 2));
-  await putFile(`${path}/metadata.json`, JSON.stringify({ created: new Date().toISOString() }, null, 2));
+async function ensureLeaf(dir) {
+  await writeJSON(path.join(dir, "buyers.json"),     { buyers: [] });
+  await writeJSON(path.join(dir, "properties.json"), { properties: [] });
+  await writeJSON(path.join(dir, "metadata.json"),   { created: new Date().toISOString() });
 }
 
 // ---------------- WOF ----------------
 async function listAdminRepos() {
-  return octokit.paginate(octokit.repos.listForOrg, {
+  return await octokit.paginate(octokit.repos.listForOrg, {
     org: WOF_ORG,
     per_page: 100
   });
@@ -86,12 +65,12 @@ async function fetchRepoTree(owner, repo) {
     recursive: "1"
   });
   return tree.data.tree
-    .filter(t => t.path.endsWith(".geojson"))
-    .map(t => t.path);
+    .map(t => t.path)
+    .filter(p => p.endsWith(".geojson"));
 }
 
-async function fetchRaw(owner, repo, path) {
-  const url = `https://raw.githubusercontent.com/${owner}/${repo}/main/${path}`;
+async function fetchRaw(owner, repo, pathInRepo) {
+  const url = `https://raw.githubusercontent.com/${owner}/${repo}/main/${pathInRepo}`;
   try {
     return (await axios.get(url, { timeout: 60000 })).data;
   } catch {
@@ -99,7 +78,16 @@ async function fetchRaw(owner, repo, path) {
   }
 }
 
-// ---------------- PARSE ----------------
+// ---------------- Parsing ----------------
+const ALLOWED = new Set(["country", "region", "locality", "neighbourhood", "microhood"]);
+
+const CHILD_MAP = {
+  country: ["region"],
+  region: ["locality"],
+  locality: ["neighbourhood"],
+  neighbourhood: ["microhood"]
+};
+
 function parseRecord(obj) {
   const p = obj?.properties;
   if (!p) return null;
@@ -116,7 +104,6 @@ function parseRecord(obj) {
   };
 }
 
-// ---------------- GRAPH ----------------
 function buildGraph(records) {
   const map = new Map();
   records.forEach(r => map.set(r.id, r));
@@ -125,10 +112,8 @@ function buildGraph(records) {
     const parent = map.get(r.parent);
     if (!parent) continue;
 
-    const allowedChildren = PLACETYPE_CHAIN[parent.placetype];
-    if (!allowedChildren) continue;
-
-    if (allowedChildren.includes(r.placetype)) {
+    const allowed = CHILD_MAP[parent.placetype] || [];
+    if (allowed.includes(r.placetype)) {
       parent.children.push(r);
     }
   }
@@ -136,52 +121,54 @@ function buildGraph(records) {
   return [...map.values()].filter(r => r.placetype === "country");
 }
 
-// ---------------- TREE CREATION ----------------
-async function createTree(node, basePath, visited = new Set()) {
+// ---------------- Tree Build (LOCAL) ----------------
+async function createTree(node, baseDir, visited = new Set()) {
   if (visited.has(node.id)) return;
   visited.add(node.id);
 
-  const path = `${basePath}/${sanitize(node.name)}`;
-  await ensureFolder(path);
+  const thisDir = path.join(baseDir, sanitize(node.name));
+  await ensureDir(thisDir);
 
   if (!node.children.length) {
-    await ensureLeaf(path);
+    await ensureLeaf(thisDir);
     return;
   }
 
   for (const ch of node.children) {
-    await createTree(ch, path, visited);
+    await createTree(ch, thisDir, visited);
   }
 }
 
 // ---------------- MAIN ----------------
 (async function main() {
-  console.log("HYBRID V2 — WOF hierarchy build started");
+  console.log("Hybrid V3 started");
+
+  await ensureDir(ROOT_DIR);
 
   const repos = await listAdminRepos();
   const adminRepos = repos.filter(r => r.name.startsWith("whosonfirst-data-admin-"));
 
   for (const repo of adminRepos) {
-    console.log("Processing:", repo.name);
+    console.log("Processing repo:", repo.name);
 
     const files = await fetchRepoTree(repo.owner.login, repo.name);
-    const records = [];
+    const recs = [];
 
     for (const f of files) {
       const raw = await fetchRaw(repo.owner.login, repo.name, f);
       if (!raw) continue;
       const rec = parseRecord(raw);
-      if (rec) records.push(rec);
+      if (rec) recs.push(rec);
     }
 
-    const roots = buildGraph(records);
+    const roots = buildGraph(recs);
 
     for (const country of roots) {
-      await createTree(country, ROOT);
+      await createTree(country, ROOT_DIR);
     }
 
-    await sleep(1000);
+    await sleep(500);
   }
 
-  console.log("HYBRID V2 COMPLETE — folders created correctly");
+  console.log("Local tree build complete. Git commit happens in workflow.");
 })();
