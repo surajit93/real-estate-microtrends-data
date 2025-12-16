@@ -1,9 +1,9 @@
-name: WOF Generate Folders
+name: WOF Build Tree
 
 on:
-  workflow_dispatch:
   schedule:
     - cron: "0 2 * * *"
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -13,39 +13,29 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout repo
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
-          persist-credentials: false
           fetch-depth: 0
+          persist-credentials: false
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
+      - uses: actions/setup-node@v4
         with:
           node-version: 20
 
-      - name: Install dependencies
+      - name: Install deps
         run: |
           npm init -y
-          npm install axios @octokit/rest p-queue
+          npm i axios @octokit/rest
 
-      - name: Prepare folders
-        run: mkdir -p data/wof
-
-      - name: Generate WOF folder tree locally
+      - name: Run builder
         env:
           PAT_TOKEN: ${{ secrets.PAT_TOKEN }}
-          GITHUB_OWNER: ${{ github.repository_owner }}
-          GITHUB_REPO: ${{ github.event.repository.name }}
-          BRANCH: main
-          TARGET_DIR: data/wof
-          WOF_ORG: whosonfirst-data
         run: node repo/wof_create_folders.js
 
-      - name: Commit & push changes
+      - name: Commit & push
         run: |
           git config user.name "GitHub Actions"
           git config user.email "actions@github.com"
           git add -A
-          git commit -m "Auto update WOF tree - $(date)" || echo "No changes to commit"
+          git commit -m "Update geolocations tree $(date)" || echo "No changes"
           git push
