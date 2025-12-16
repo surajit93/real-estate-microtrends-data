@@ -1,37 +1,38 @@
 name: WOF Generate Folders
 
 on:
-  schedule:
-    - cron: '0 2 * * *'   # daily at 02:00 UTC — adjust if needed
   workflow_dispatch:
+  schedule:
+    - cron: "0 2 * * *"
 
 permissions:
-  contents: write   # allow action to create/update files in repo
+  contents: write
 
 jobs:
-  generate:
+  build:
     runs-on: ubuntu-latest
+
     steps:
-      - name: Checkout repo (no LFS required)
+      - name: Checkout repo
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0
           persist-credentials: false
+          fetch-depth: 0
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '20.x'
+          node-version: 20
 
-      - name: Install npm deps
+      - name: Install dependencies
         run: |
-          # package.json isn't required — script uses only axios and @octokit/rest
           npm init -y
-          npm i axios @octokit/rest p-queue
-        env:
-          CI: true
+          npm install axios @octokit/rest p-queue
 
-      - name: Run WOF folder generator
+      - name: Prepare folders
+        run: mkdir -p data/wof
+
+      - name: Generate WOF folder tree locally
         env:
           PAT_TOKEN: ${{ secrets.PAT_TOKEN }}
           GITHUB_OWNER: ${{ github.repository_owner }}
@@ -39,8 +40,12 @@ jobs:
           BRANCH: main
           TARGET_DIR: data/wof
           WOF_ORG: whosonfirst-data
-          COUNTRY_CONCURRENCY: '1'
-          CITY_CONCURRENCY: '4'
-          LOCALITY_CONCURRENCY: '4'
+        run: node repo/wof_create_folders.js
+
+      - name: Commit & push changes
         run: |
-          node repo/wof_create_folders.js
+          git config user.name "GitHub Actions"
+          git config user.email "actions@github.com"
+          git add -A
+          git commit -m "Auto update WOF tree - $(date)" || echo "No changes to commit"
+          git push
