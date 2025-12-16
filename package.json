@@ -9,5 +9,14 @@
     "fast-glob": "^3.3.3",
     "fs-extra": "^11.3.2",
     "unzipper": "^0.12.3"
-  }
+  },
+  "main": "index.js",
+  "devDependencies": {},
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "description": ""
 }
