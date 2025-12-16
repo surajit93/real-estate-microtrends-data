@@ -1,23 +1,26 @@
 // ==========================================================
-// wof_build_tree_v6.js  — FULL WORKING VERSION
-// ==========================================================
-// • Downloads full WOF admin repos locally via git clone
-// • Processes ONLY your requested countries
-// • Builds folder tree in ./geolocations
-// • Leaf → creates ./real-estate metadata/buyers/properties
-// • Tracks progress in .real_estate_progress/.progress.json
-// • Commits the tree in one push (GitHub workflow step)
+// wof_build_tree_v7.js — FIXED, FULLY WORKING
 // ==========================================================
 
 import fs from "fs";
 import fsp from "fs/promises";
 import path from "path";
 import { execSync } from "child_process";
+import { Octokit } from "@octokit/rest";
 
+const TOKEN = process.env.PAT_TOKEN;
+if (!TOKEN) throw new Error("PAT_TOKEN missing");
+
+const octokit = new Octokit({ auth: TOKEN });
+
+// ------------------------------------------------------------
+// PROGRESS
+// ------------------------------------------------------------
 const PROGRESS_DIR = ".real_estate_progress";
 const PROGRESS_FILE = path.join(PROGRESS_DIR, ".progress.json");
 
 if (!fs.existsSync(PROGRESS_DIR)) fs.mkdirSync(PROGRESS_DIR);
+
 if (!fs.existsSync(PROGRESS_FILE)) {
   fs.writeFileSync(PROGRESS_FILE, JSON.stringify({ repo_index: 0 }, null, 2));
 }
@@ -33,15 +36,14 @@ const ALLOWED = new Set([
   "ZA","SA","AE","QA","KW","BH","OM","CN","TW","KR","KP","NZ","ID","MY","SG","PH"
 ]);
 
+const WOF_ORG = "whosonfirst-data";
 const ROOT = "geolocations";
+
 if (!fs.existsSync(ROOT)) fs.mkdirSync(ROOT, { recursive: true });
 
-const WOF_ORG = "whosonfirst-data";
-
 // ------------------------------------------------------------
-// Helper functions
+// HELPERS
 // ------------------------------------------------------------
-
 function sanitize(s) {
   return s
     .normalize("NFKD")
@@ -54,26 +56,20 @@ async function ensureDir(p) {
   await fsp.mkdir(p, { recursive: true });
 }
 
-async function ensureLeafRealEstate(folder) {
+async function ensureLeaf(folder) {
   const re = path.join(folder, "real-estate");
   await ensureDir(re);
 
-  await fsp.writeFile(path.join(re, "metadata.json"),
-    JSON.stringify({ created: new Date().toISOString() }, null, 2));
-  await fsp.writeFile(path.join(re, "properties.json"),
-    JSON.stringify({ properties: [] }, null, 2));
-  await fsp.writeFile(path.join(re, "buyers.json"),
-    JSON.stringify({ buyers: [] }, null, 2));
+  await fsp.writeFile(path.join(re, "metadata.json"), JSON.stringify({ created: new Date().toISOString() }, null, 2));
+  await fsp.writeFile(path.join(re, "properties.json"), JSON.stringify({ properties: [] }, null, 2));
+  await fsp.writeFile(path.join(re, "buyers.json"), JSON.stringify({ buyers: [] }, null, 2));
 }
 
-// ------------------------------------------------------------
-// Parse WOF .geojson record
-// ------------------------------------------------------------
-function parseRecord(obj) {
-  const p = obj.properties || {};
+function parseRecord(raw) {
+  const p = raw.properties || {};
   const pt = p["wof:placetype"];
 
-  if (!["country","region","locality","neighbourhood","microhood","county"].includes(pt))
+  if (!["country","region","county","locality","neighbourhood","microhood"].includes(pt))
     return null;
 
   return {
@@ -85,9 +81,6 @@ function parseRecord(obj) {
   };
 }
 
-// ------------------------------------------------------------
-// Build in-memory hierarchy
-// ------------------------------------------------------------
 function buildTree(records) {
   const map = new Map();
   records.forEach(r => map.set(r.id, r));
@@ -98,15 +91,12 @@ function buildTree(records) {
   return [...map.values()].filter(n => n.placetype === "country");
 }
 
-// ------------------------------------------------------------
-// Recursively create folders
-// ------------------------------------------------------------
-async function createTree(node, basePath) {
-  const folder = path.join(basePath, sanitize(node.name));
+async function createTree(node, base) {
+  const folder = path.join(base, sanitize(node.name));
   await ensureDir(folder);
 
   if (!node.children.length) {
-    await ensureLeafRealEstate(folder);
+    await ensureLeaf(folder);
     return;
   }
 
@@ -118,19 +108,20 @@ async function createTree(node, basePath) {
 // ------------------------------------------------------------
 // PROCESS ONE COUNTRY REPO
 // ------------------------------------------------------------
-async function processRepo(repoName, repoIndex) {
-  const code = repoName.replace("whosonfirst-data-admin-", "").toUpperCase();
+async function processRepo(repo, index) {
+  const name = repo.name;
+  const code = name.replace("whosonfirst-data-admin-", "").toUpperCase();
 
   if (!ALLOWED.has(code)) return;
 
   console.log("Processing country:", code);
 
-  const cloneDir = `./_wof_cache/${repoName}`;
+  const cloneDir = `_wof_cache/${name}`;
   if (!fs.existsSync("_wof_cache")) fs.mkdirSync("_wof_cache");
 
   if (!fs.existsSync(cloneDir)) {
-    console.log("Cloning:", repoName);
-    execSync(`git clone --depth=1 https://github.com/${WOF_ORG}/${repoName}.git ${cloneDir}`, { stdio: "ignore" });
+    console.log("Cloning:", name);
+    execSync(`git clone --depth=1 ${repo.clone_url} ${cloneDir}`, { stdio: "ignore" });
   }
 
   const files = [];
@@ -145,16 +136,11 @@ async function processRepo(repoName, repoIndex) {
 
   const parsed = [];
 
-  files.forEach((file, idx) => {
-    progress.repo_index = repoIndex;
-    fs.writeFileSync(PROGRESS_FILE, JSON.stringify(progress, null, 2));
-
-    try {
-      const raw = JSON.parse(fs.readFileSync(file, "utf8"));
-      const rec = parseRecord(raw);
-      if (rec) parsed.push(rec);
-    } catch {}
-  });
+  for (const file of files) {
+    const raw = JSON.parse(fs.readFileSync(file, "utf8"));
+    const rec = parseRecord(raw);
+    if (rec) parsed.push(rec);
+  }
 
   if (!parsed.length) return;
 
@@ -166,28 +152,29 @@ async function processRepo(repoName, repoIndex) {
   for (const root of roots) {
     await createTree(root, countryBase);
   }
+
+  progress.repo_index = index + 1;
+  fs.writeFileSync(PROGRESS_FILE, JSON.stringify(progress, null, 2));
 }
 
 // ------------------------------------------------------------
 // MAIN
 // ------------------------------------------------------------
 (async function main() {
-  console.log("Hybrid V6 started");
+  console.log("Hybrid V7 started — FIXED REPO FETCH");
 
-  // get list of WOF admin repos via GitHub API (lightweight)
-  const repos = await (await fetch(`https://api.github.com/orgs/${WOF_ORG}/repos?per_page=200`)).json();
+  const repos = await octokit.paginate(octokit.repos.listForOrg, {
+    org: WOF_ORG,
+    per_page: 100
+  });
+
   const adminRepos = repos
     .filter(r => r.name.startsWith("whosonfirst-data-admin-"))
-    .sort((a,b) => a.name.localeCompare(b.name));
+    .sort((a, b) => a.name.localeCompare(b.name));
 
   for (let i = progress.repo_index; i < adminRepos.length; i++) {
-    const repoObj = adminRepos[i];
-    try {
-      await processRepo(repoObj.name, i);
-    } catch (e) {
-      console.log("Failed repo:", repoObj.name, e.message);
-    }
+    await processRepo(adminRepos[i], i);
   }
 
-  console.log("DONE — LOCAL TREE COMPLETE");
+  console.log("DONE — full geolocation tree generated");
 })();
