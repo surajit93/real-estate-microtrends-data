@@ -24,7 +24,7 @@ jobs:
       - name: Install dependencies
         run: |
           npm init -y
-          npm install
+          npm install @octokit/rest axios
 
       - name: Run builder
         env:
